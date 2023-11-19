@@ -1,4 +1,5 @@
 #include <utility/object_pool.h>
+#include <utility/perf_profiler.h>
 #include <vector>
 #include <thread>
 #include <mutex>
@@ -11,10 +12,9 @@ struct ObjDemo
     char a{'1'};
     uint8_t b{2};
     uint16_t c{3};
-    int d{4};
-    uint32_t e{5};
-    uint64_t q{6};
-    char f[64];
+    uint32_t d{4};
+    uint64_t e{6};
+    char f[4080];
     
     void Set(char ch)
     {
@@ -23,7 +23,6 @@ struct ObjDemo
         c = 3;
         d = 4;
         e = 5;
-        q = 6;
         memset(f, ch, sizeof(f));
     }
 
@@ -42,7 +41,7 @@ struct ObjDemo
 
     bool IsOk()
     {
-        return b==2 && c == 3 && d == 4 && e == 5 && q == 6 && IsFOk();
+        return b==2 && c == 3 && d == 4 && e == 5 && IsFOk();
     }
 };
 
@@ -170,10 +169,58 @@ void CaseMultiThreadOneByOne()
     PRINT_INFO("=================");
 }
 
+void CasePerf()
+{
+    PRINT_INFO("=================");
+    CPerfProfiler perfGet, perfRelease;
+    TestHelper helper;
+    auto pool = helper.m_pool;
+    // sleep(60);
+    uint32_t count = 32;
+    auto ptrArr = (ObjDemo **)malloc(sizeof(ObjDemo *)*count * 1024);
+    auto newCount = 0;
+
+    // 热身
+    for (uint32_t i = 0; i < count * 1024; i++)
+    {
+        auto ptr = (ObjDemo *)pool.Get();
+        ptrArr[newCount++] = ptr;
+    }
+    for (uint32_t i = 0; i < newCount; i++)
+    {
+        pool.Release(ptrArr[i]);
+    }
+
+    // 开始测试
+    newCount = 0;
+    perfGet.Add("begin");
+    for (uint32_t i = 0; i < count; i++)
+    {
+        auto ptr = (ObjDemo *)pool.Get();
+        perfGet.Add("Get");
+        ptrArr[newCount++] = ptr;
+    }
+
+    perfRelease.Add("begin");
+    for (uint32_t i = 0; i < newCount; i++)
+    {
+        pool.Release(ptrArr[i]);
+        perfRelease.Add("Release");
+    }
+
+    free(ptrArr);
+    perfGet.Print("Get");
+    perfGet.Save("Get.csv");
+    perfRelease.Print("Release");
+    perfRelease.Save("Release.csv");
+    PRINT_INFO("=================");
+}
+
 int main(int argc, const char *argv[])
 {
-    CaseOneByOne();
-    CaseManyGet2Release();
-    CaseMultiThreadOneByOne();
+    // CaseOneByOne();
+    // CaseManyGet2Release();
+    // CaseMultiThreadOneByOne();
+    CasePerf();
     return 0;
 }

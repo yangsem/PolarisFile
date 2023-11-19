@@ -10,6 +10,7 @@
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
+#include <time.h>
 
 #if defined(__WIN32) || defined(__WIN64)
 #define OS_WIN

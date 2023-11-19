@@ -2,6 +2,7 @@
 #define __OBJECT_POOL_H
 
 #include <include/common.h>
+#include <utility/perf_profiler.h>
 
 #ifdef OS_WIN
 #include <intrin.h>
@@ -11,6 +12,7 @@ namespace utility
 {
 
     using BitSetType = uint64_t;
+    constexpr uint16_t BitSetScale = (3 + 3); // 8 * 8 = 64 = sizeof(BitSetType)
 
     constexpr uint16_t BlockObjectSize = 1024; // 要能被64整除！
     constexpr uint32_t BlockBitSize = BlockObjectSize / (sizeof(BitSetType) * 8);
@@ -51,8 +53,10 @@ namespace utility
                 memset(bitSetFree_, 0XFF, sizeof(bitSetFree_));
             }
 
+            // 块内元素被全部耗尽
             bool IsEmpty() { return uCurrSize_ == BlockObjectSize; }
-            bool IsFull() { return uCurrSize_ == 0; }
+            // 块内元素未被使用
+            bool IsReFill() { return uCurrSize_ == 0; }
             uint32_t GetCurrSize() { return uCurrSize_; }
 
             ElemHead *GetObject(uint32_t uObjSize)
@@ -69,7 +73,7 @@ namespace utility
 #endif
                         bitSetFree_[i] &= ~(BitSetType(1) << idx);
                         uCurrSize_++;
-                        uint32_t uObjIdx = (i << 3) + idx;
+                        uint16_t uObjIdx = (i << BitSetScale) + idx;
                         auto lpElemHead = (ElemHead *)&pData_[uObjIdx * uObjSize];
                         lpElemHead->Reset(uObjIdx, (uint64_t)this);
                         return lpElemHead;
@@ -82,7 +86,7 @@ namespace utility
             void ReleaseObject(ElemHead *lpElemHead)
             {
                 auto ObjIndex_ = lpElemHead->GetObjIndex();
-                auto bitSetIndex = ObjIndex_ >> 3;
+                auto bitSetIndex = ObjIndex_ >> BitSetScale;
                 auto bitIndex = ObjIndex_ & 0x0F;
                 bitSetFree_[bitSetIndex] |= (1 << bitIndex);
                 uCurrSize_--;
@@ -134,10 +138,10 @@ namespace utility
 
         void *Get()
         {
-            // 向后找下一个可用的块
+            // 向后找下一个可用的块，预期只有两次循环，curr和next
             for (uint32_t i = m_uCurrIndex; i != m_uRear; i = GetNext(i))
             {
-                if (m_lppBlocks[i] != nullptr && !m_lppBlocks[i]->IsEmpty())
+                if (likely(m_lppBlocks[i] != nullptr && !m_lppBlocks[i]->IsEmpty()))
                 {
                     // 有上面两个判断，必定是成功，否则是程序异常
                     auto lpElemHead = m_lppBlocks[i]->GetObject(m_uObjectSize);
@@ -147,9 +151,10 @@ namespace utility
             }
 
             // 向前找一个可用
-            for (uint32_t i = m_uCurrIndex; i != m_uFront; i = GetPrev(i))
+            auto end = GetPrev(m_uFront);
+            for (uint32_t i = m_uCurrIndex; i != end; i = GetPrev(i))
             {
-                if (m_lppBlocks[i] != nullptr && !m_lppBlocks[i]->IsEmpty())
+                if (likely(m_lppBlocks[i] != nullptr && !m_lppBlocks[i]->IsEmpty()))
                 {
                     // 有上面两个判断，必定是成功，否则是程序异常
                     auto lpElemHead = m_lppBlocks[i]->GetObject(m_uObjectSize);
@@ -160,7 +165,7 @@ namespace utility
 
             // 扩容
             auto lpBlock = Expand();
-            if (lpBlock != nullptr)
+            if (likely(lpBlock != nullptr))
             {
                 m_uCurrIndex = lpBlock->uIndex_;
                 auto lpElemHead = lpBlock->GetObject(m_uObjectSize);
@@ -173,7 +178,7 @@ namespace utility
 
         void Release(void *ptr)
         {
-            if (ptr == nullptr)
+            if (unlikely(ptr == nullptr))
             {
                 return;
             }
@@ -181,21 +186,20 @@ namespace utility
             auto lpElemHead = (ElemHead *)((uint8_t *)ptr - sizeof(ElemHead));
             auto lpOwnerBlock = (ObjectBlock *)lpElemHead->GetOwnerBlockPtr();
             lpOwnerBlock->ReleaseObject(lpElemHead);
-            if (lpOwnerBlock->uIndex_ != m_uCurrIndex && lpOwnerBlock->IsFull())
+            if (unlikely(lpOwnerBlock->IsReFill() && lpOwnerBlock->uIndex_ != m_uCurrIndex))
             {
                 m_lppBlocks[lpOwnerBlock->uIndex_] = nullptr;
-                if (m_uRear == m_uFront)
+                // 存在有人长期不释放内存，那就要整理内存
+                if (unlikely(m_uRear == m_uFront))
                 {
-                    free(lpOwnerBlock);
-                }
-                else
-                {
-                    lpOwnerBlock->Reset(m_uRear);
-                    m_lppBlocks[m_uRear] = lpOwnerBlock;
-                    m_uRear = GetNext(m_uRear);
+                    CompactFrontBlock(); // m_uFront至少前进一格，因为当前要释放的块位置置空了
                 }
 
-                while (m_lppBlocks[m_uFront] == nullptr)
+                lpOwnerBlock->Reset(m_uRear);
+                m_lppBlocks[m_uRear] = lpOwnerBlock;
+                m_uRear = GetNext(m_uRear);
+                // 提前调整范围，减少get的搜索范围
+                while (m_lppBlocks[m_uFront] == nullptr && m_uFront != m_uCurrIndex)
                 {
                     m_uFront = GetNext(m_uFront);
                 }
@@ -206,13 +210,34 @@ namespace utility
         uint32_t GetNext(uint32_t uIndex) { return (uIndex + 1) % m_uCapSize; }
         uint32_t GetPrev(uint32_t uIndex) { return (uIndex + m_uCapSize - 1) % m_uCapSize; }
 
+        // 整理用过的内存块
+        void CompactFrontBlock()
+        {
+            auto begin = GetPrev(m_uCurrIndex);
+            auto end = GetPrev(m_uFront);
+            auto slow = m_uCurrIndex;
+            // 遍历 [front, curr) 范围，收缩所有非null的块
+            for (uint32_t fast = begin; fast != end; fast = GetPrev(fast))
+            {
+                auto lpCurBlock = m_lppBlocks[fast];
+                if (lpCurBlock != nullptr && slow != fast)
+                {
+                    slow = GetPrev(slow);
+                    lpCurBlock->Reset(slow);
+                    m_lppBlocks[slow] = lpCurBlock;
+                    m_lppBlocks[fast] = nullptr;
+                }
+            }
+            m_uFront = slow;
+        }
+
         ObjectBlock *Expand()
         {
-            if (m_uCurrSize == m_uCapSize)
+            if (unlikely(m_uCurrSize == m_uCapSize))
             {
                 auto uNewCap = m_uCapSize * 2;
                 auto lppTmpBlocks = (ObjectBlock **)calloc(uNewCap, sizeof(ObjectBlock *));
-                if (lppTmpBlocks == nullptr)
+                if (unlikely(lppTmpBlocks == nullptr))
                 {
                     return nullptr;
                 }
@@ -234,8 +259,13 @@ namespace utility
                 m_uCurrIndex = 0;
             }
 
+            if (unlikely(m_uRear == m_uFront))
+            {
+                CompactFrontBlock(); // 这里一定可以整理出空位，因为槽位没满，所有可以进行下一步
+            }
+
             auto lpNewBlock = (ObjectBlock *)malloc(sizeof(ObjectBlock) + m_uObjectSize * BlockObjectSize);
-            if (lpNewBlock == nullptr)
+            if (unlikely(lpNewBlock == nullptr))
             {
                 return nullptr;
             }

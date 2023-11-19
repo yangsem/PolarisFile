@@ -31,6 +31,10 @@
 *.out
 *.app
 
-# dir
+# Dir
 .vscode
 build
+
+# LogFile and PerfDataFile
+*.log
+*.csv
