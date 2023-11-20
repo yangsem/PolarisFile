@@ -296,7 +296,7 @@ namespace utility
             {
                 for (uint32_t i = 0; i < BlockObjectSize; i++)
                 {
-                    auto ptr = (ElemHead *)lpNewBlock->pData_[i + m_uObjectSize];
+                    auto ptr = (ElemHead *)&lpNewBlock->pData_[i + m_uObjectSize];
                     m_funcConstruct(ptr->pData_);
                 }
             }
