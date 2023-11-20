@@ -4,6 +4,10 @@
 #include <include/common.h>
 #include <vector>
 
+#define GetTimeDiff(begin, end) uint64_t((end.tv_sec - begin.tv_sec) * (1000 * 1000 * 1000) + (end.tv_nsec - begin.tv_nsec));
+#define BeginPerfTest(name) CPerfProfilerWrap ts_begin_##name, ts_end_##name; clock_gettime(CLOCK_MONOTONIC, &ts_begin_##name);
+#define EndPerfTest(name, channal) clock_gettime(CLOCK_MONOTONIC, &ts_end_##name); fprintf(channal, #name " = %lu\n", GetTimeDiff(ts_begin_##name, ts_end_##name));
+
 namespace utility
 {
     constexpr uint32_t StepTimePointSize = 256;
@@ -30,13 +34,10 @@ namespace utility
     public:
         CPerfProfiler(IObjAllocator *lpAllocator = nullptr) : m_lpAllocator(lpAllocator)
         {
-            if (m_lpAllocator != nullptr)
+            if (m_lpAllocator != nullptr && m_lpAllocator->SetObjSize(sizeof(TimePoint[StepTimePointSize])) != 0)
             {
-                m_lpAllocator->SetObjSize(sizeof(TimePoint[StepTimePointSize]));
+                m_lpAllocator = nullptr;
             }
-            m_vecTimes.reserve(16);
-            // m_lpTime = m_Time;
-            // m_uSize = 0;
         }
 
         ~CPerfProfiler()
@@ -53,6 +54,11 @@ namespace utility
             }
         }
 
+        static void GetTime(timespec &ts)
+        {
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+        }
+
         static uint64_t GetTimeNano(timespec &ts)
         {
             return uint64_t(ts.tv_sec * 1000000000 + ts.tv_nsec);
@@ -63,7 +69,7 @@ namespace utility
             return uint64_t((end.tv_sec - begin.tv_sec) * 1000000000 + (end.tv_nsec - begin.tv_nsec));
         }
 
-        void Add(const char *lpName, timespec &ts)
+        void Add(const char *lpName)
         {
             if (unlikely(m_lpTime == nullptr))
             {
@@ -73,48 +79,89 @@ namespace utility
             if (unlikely(m_lpTime == m_Time && m_uSize >= sizeof(m_Time)/sizeof(TimePoint)) 
                 || unlikely(m_uSize >= StepTimePointSize))
             {
-                m_vecTimes.push_back(m_lpTime);
-                m_lpTime = nullptr;
-                m_uSize = 0;
-                if (m_lpAllocator != nullptr)
-                {
-                    m_lpTime = m_lpAllocator->Get();
-                }
-
-                if (m_lpTime == nullptr)
+                if (unlikely(Expand() == nullptr))
                 {
                     return;
                 }
             }
 
             m_lpTime[m_uSize].lpName_ = lpName;
-            m_lpTime[m_uSize].tsTime_ = ts;
+            GetTime(m_lpTime[m_uSize].tsTime_);
             m_uSize++;
         }
 
-        void Add(const char *lpName)
+        uint32_t GetSize() { return m_vecTimes.size() * StepTimePointSize + m_uSize; }
+
+        TimePoint *At(uint32_t i)
         {
-            timespec ts;
-            clock_gettime(CLOCK_MONOTONIC, &ts);
-            Add(lpName, ts);
+            if (i >= GetSize())
+            {
+                return nullptr;
+            }
+
+            auto uVecSize = m_vecTimes.size() * StepTimePointSize;
+            if (i < uVecSize)
+            {
+                return &m_vecTimes[i / StepTimePointSize][i % StepTimePointSize];
+            }
+
+            return &m_lpTime[i - uVecSize];
         }
+
+    private:
+        TimePoint *Expand()
+        {
+            timespec tmpTs;
+            GetTime(tmpTs);
+
+            m_vecTimes.push_back(m_lpTime);
+            m_lpTime = nullptr;
+            m_uSize = 0;
+            
+            if (m_lpAllocator != nullptr)
+            {
+                m_lpTime = m_lpAllocator->Get();
+            }
+            if (m_lpTime != nullptr)
+            {
+                m_lpTime[m_uSize].lpName_ = "__pf_expand";
+                m_lpTime[m_uSize].tsTime_ = tmpTs;
+                m_uSize++;
+                return m_lpTime;
+            }
+            
+            return nullptr;
+        }
+
+    private:
+        TimePoint m_Time[StepTimePointSize];
+        TimePoint *m_lpTime{m_Time};
+        IObjAllocator *m_lpAllocator{nullptr};
+        uint32_t m_uSize{0};
+        uint32_t Reverse{0};
+        std::vector<TimePoint *> m_vecTimes;
+    };
+
+    class CPerfProfilerWrap
+    {
+    public:
+        CPerfProfilerWrap(CPerfProfiler::IObjAllocator *lpAllocator = nullptr) : m_perf(lpAllocator)
+        {
+            m_perf.Add("begin");
+        }
+
+        ~CPerfProfilerWrap() = default;
+
+        void Add(const char *lpName) { m_perf.Add(lpName); }
 
         void Print(const char *szTip)
         {
             uint64_t uSum = 0;
             uint64_t uCount = 0;
-            for (auto &item : m_vecTimes)
+            auto uSize = m_perf.GetSize();
+            for (uint32_t i = 1; i < uSize; i++)
             {
-                uint32_t uMaxSize = item == m_Time ? sizeof(m_Time)/sizeof(TimePoint) : StepTimePointSize;
-                for (uint32_t i = 1; i < uMaxSize; i++)
-                {
-                    uSum += GetTimeDiffNano(item[i-1].tsTime_, item[i].tsTime_);
-                    uCount++;
-                }
-            }
-            for (uint32_t i = 1; i < m_uSize; i++)
-            {
-                uSum += GetTimeDiffNano(m_lpTime[i-1].tsTime_, m_lpTime[i].tsTime_);
+                uSum += CPerfProfiler::GetTimeDiffNano(m_perf.At(i - 1)->tsTime_, m_perf.At(i)->tsTime_);
                 uCount++;
             }
             
@@ -122,36 +169,31 @@ namespace utility
             {
                 printf("empty statics!\n");
             }
-            printf("\n%s: avg = %lu\n",szTip, uSum / uCount);
+            else
+            {
+                printf("\n%s: avg = %lu\n",szTip, uSum / uCount);
+            }
         }
 
         void Save(const char *szName)
         {
             auto lpFile = fopen(szName, "w");
-            if (lpFile == nullptr) return;
+            if (lpFile == nullptr)
+            {
+                return;
+            }
 
-            for (auto &item : m_vecTimes)
+            auto uSize = m_perf.GetSize();
+            for (uint32_t i = 1; i < uSize; i++)
             {
-                uint32_t uMaxSize = item == m_Time ? sizeof(m_Time)/sizeof(TimePoint) : StepTimePointSize;
-                for (uint32_t i = 1; i < uMaxSize; i++)
-                {
-                    fprintf(lpFile, "%s, %lu\n", item[i].lpName_, GetTimeDiffNano(item[i-1].tsTime_, item[i].tsTime_));
-                }
+                fprintf(lpFile, "%s, %lu\n",m_perf.At(i)->lpName_,  CPerfProfiler::GetTimeDiffNano(m_perf.At(i - 1)->tsTime_, m_perf.At(i)->tsTime_));
             }
-            for (uint32_t i = 1; i < m_uSize; i++)
-            {
-                fprintf(lpFile, "%s, %lu\n", m_lpTime[i].lpName_, GetTimeDiffNano(m_lpTime[i-1].tsTime_, m_lpTime[i].tsTime_));
-            }
+
             fclose(lpFile);
         }
 
     private:
-        TimePoint m_Time[32];
-        TimePoint *m_lpTime{m_Time};
-        IObjAllocator *m_lpAllocator{nullptr};
-        uint32_t m_uSize{0};
-        uint32_t Reverse{0};
-        std::vector<TimePoint *> m_vecTimes;
+        CPerfProfiler m_perf;
     };
 
 } // end namespace utility

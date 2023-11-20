@@ -1,6 +1,7 @@
 #ifndef __OBJECT_POOL_H
 #define __OBJECT_POOL_H
 
+#include <functional>
 #include <include/common.h>
 #include <utility/perf_profiler.h>
 
@@ -97,9 +98,11 @@ namespace utility
         CObjectPool() = default;
         ~CObjectPool() = default;
 
-        int32_t Init(uint32_t uObjectSize)
+        int32_t Init(uint32_t uObjectSize, std::function<void(void*)> funcConstruct = nullptr)
         {
             UnInit();
+
+            m_funcConstruct = funcConstruct;
 
             m_lppBlocks = (ObjectBlock **)calloc(MinBlockCount, sizeof(ObjectBlock *));
             if (m_lppBlocks == nullptr)
@@ -231,6 +234,24 @@ namespace utility
             m_uFront = slow;
         }
 
+        void WarnUp(void *ptr, uint32_t uSize)
+        {
+            uint32_t uPageSize = 0;
+#ifdef OS_WIN
+            SYSTEM_INFO si;
+            GetSystemInfo(&si);
+            uPageSize = (uint32_t)si.dwPageSize;
+#else
+            uPageSize = (uint32_t)sysconf(_SC_PAGESIZE);
+#endif
+            auto addr = (uint8_t *)ptr;
+            for (uint32_t offset = 0; offset < uSize; offset += uPageSize)
+            {
+                addr[offset] = 0x00;
+            }
+            addr[uSize - 1] = 0x00;
+        }
+
         ObjectBlock *Expand()
         {
             if (unlikely(m_uCurrSize == m_uCapSize))
@@ -264,11 +285,26 @@ namespace utility
                 CompactFrontBlock(); // 这里一定可以整理出空位，因为槽位没满，所有可以进行下一步
             }
 
-            auto lpNewBlock = (ObjectBlock *)malloc(sizeof(ObjectBlock) + m_uObjectSize * BlockObjectSize);
+            uint32_t uBlockSize = sizeof(ObjectBlock) + m_uObjectSize * BlockObjectSize;
+            auto lpNewBlock = (ObjectBlock *)malloc(uBlockSize);
             if (unlikely(lpNewBlock == nullptr))
             {
                 return nullptr;
             }
+
+            if (m_funcConstruct != nullptr)
+            {
+                for (uint32_t i = 0; i < BlockObjectSize; i++)
+                {
+                    auto ptr = (ElemHead *)lpNewBlock->pData_[i + m_uObjectSize];
+                    m_funcConstruct(ptr->pData_);
+                }
+            }
+            else
+            {
+                WarnUp(lpNewBlock, uBlockSize);
+            }
+
             lpNewBlock->Reset(m_uRear);
             m_lppBlocks[m_uRear] = lpNewBlock;
             m_uRear = GetNext(m_uRear);
@@ -284,6 +320,7 @@ namespace utility
         uint32_t m_uRear{0};
         uint32_t m_uCapSize{0};
         ObjectBlock **m_lppBlocks{nullptr};
+        std::function<void(void*)> m_funcConstruct;
     };
 
 } // end namespace utilitiy

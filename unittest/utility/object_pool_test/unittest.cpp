@@ -172,13 +172,14 @@ void CaseMultiThreadOneByOne()
 void CasePerf()
 {
     PRINT_INFO("=================");
-    CPerfProfiler perfGet, perfRelease;
     TestHelper helper;
     auto pool = helper.m_pool;
-    // sleep(60);
+    
     uint32_t count = 32;
     auto ptrArr = (ObjDemo **)malloc(sizeof(ObjDemo *)*count * 1024);
+    memset(ptrArr, 0x00, sizeof(ObjDemo *)*count * 1024);
     auto newCount = 0;
+    // sleep(60);
 
     // 热身
     for (uint32_t i = 0; i < count * 1024; i++)
@@ -193,7 +194,7 @@ void CasePerf()
 
     // 开始测试
     newCount = 0;
-    perfGet.Add("begin");
+    CPerfProfilerWrap perfGet;
     for (uint32_t i = 0; i < count; i++)
     {
         auto ptr = (ObjDemo *)pool.Get();
@@ -201,7 +202,7 @@ void CasePerf()
         ptrArr[newCount++] = ptr;
     }
 
-    perfRelease.Add("begin");
+    CPerfProfilerWrap perfRelease;
     for (uint32_t i = 0; i < newCount; i++)
     {
         pool.Release(ptrArr[i]);
